@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Datasets (not redistributed, see Datasets/README.md)
+Datasets/*.csv
+
+# Experiment outputs
+*.pkl
+Resultados_*.csv
+results_*.csv
+results_report.txt
+*.pdf

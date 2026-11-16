@@ -1,0 +1,512 @@
+import os
+import pickle
+import argparse
+import time
+from experiments import optimize_models_parameters, evaluate_models, tune_sampler_for_dataset
+from data_setup import prepare_datasets
+from imblearn.over_sampling import SMOTE, ADASYN, BorderlineSMOTE
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+from pytorch_tabnet.tab_model import TabNetClassifier
+from cor_smote import CorSMOTE
+import warnings
+from sklearn.exceptions import DataConversionWarning
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import smote_variants as sv
+from additional_samplers import SVSamplerWrapper
+# Ignorar solo los warnings de DataConversionWarning (nombre de columnas)
+warnings.filterwarnings("ignore", category=UserWarning, message="X does not have valid feature names*")
+cpus_asignadas = int(os.getenv('SLURM_CPUS_PER_TASK', 1))
+MODELS_MAP = {
+    'dt' : 'Decision Tree',
+    'rf' : 'Random Forest',
+    'bagging' : 'Bagging',
+    'lightgbm' : 'LightGBM',
+    'xgboost' : 'XGBoost',
+    'mlp' : 'MLP',
+    'tabnet' : 'TabNet',
+    'svm' : 'SVM'
+}
+# Parámetros a optimizar para cada modelo
+param_grids = {
+    "Decision Tree": {
+        "max_depth": [3, 5, 10, None],
+        "min_samples_split": [2, 5, 10]
+    },
+    "Random Forest": {
+        "n_estimators": [100, 200],
+        "max_depth": [None, 10, 20],
+        "max_features": ["sqrt", "log2"]
+    },
+    "Bagging": {
+        "n_estimators": [50, 100, 200],
+        "max_samples": [0.5, 0.8, 1.0]
+    },
+    "XGBoost": {
+        "n_estimators": [100, 200],
+        "max_depth": [3, 6, 10],
+        "learning_rate": [0.01, 0.1, 0.2]
+    },
+    "MLP": {
+        "hidden_layer_sizes": [(50,), (100,), (100,50)],
+        "activation": ["relu"],
+        "alpha": [0.0001],
+    },
+    "TabNet": {
+        "n_d": [8,16],
+        "n_a": [8,16],
+        "n_steps": [3,5],
+        "gamma": [1.3,1.5]
+    },
+    "SVM": {
+        "C": [0.1,1,10],
+        "gamma": ["scale","auto"],
+        "kernel": ["rbf"]
+    },
+    "LightGBM": {
+        "n_estimators": [200, 500],
+        "num_leaves": [31,64],
+        "learning_rate": [0.01, 0.05, 0.1],
+        "max_depth": [-1, 10,20]
+    }
+
+}
+SAMPLING_RATIOS = [ 0.6, 0.8, 1.0]
+
+# Columnas de tiempo que se añaden a cada fila de resultados.
+# tuning_time        -> tiempo de optimizar hiperparámetros (del sampler, si aplica, + del modelo)
+# resampling_time    -> tiempo del fit_resample() que realmente genera los datos usados para entrenar esa fila
+# classification_time-> tiempo de evaluate_models() (entrenar el modelo final + predecir sobre test)
+TIME_COLS = ["tuning_time", "resampling_time", "classification_time"]
+
+
+def run_training_pipeline(
+    prepared_datasets: dict,
+    models,
+    param_grids: dict,
+    samplers,
+    seed,
+    table,
+    results_file: str = "results.pkl",
+    overwrite: bool = False
+) -> dict:
+    """
+    Pipeline for TFM: trains models on original and resampled datasets,
+    optimizes sampler and model parameters, and saves results incrementally.
+    :param prepared_datasets: dict returned by prepare_datasets()
+    :param models: dict of models to train
+    :param param_grids: dict of hyperparameter grids for models
+    :param results_file: Pickle file to save accumulated results
+    :param overwrite: if True, recalculates datasets even if already in results
+    :return: dict with all results
+    """
+
+    # models = {k: v for k, v in MODELS.items() if k in models}
+
+    # Load previous results if they exist
+    if os.path.exists(results_file):
+        # print("[INFO] Found results file.")
+        with open(results_file, "rb") as f:
+            results = pickle.load(f)
+
+    else:
+        results = {}
+
+    # Iterate over datasets
+    for ds_name, data in prepared_datasets.items():
+
+        np.random.seed(seed)
+        current_models = {
+            'Decision Tree' : DecisionTreeClassifier(random_state=seed),
+            'Random Forest': RandomForestClassifier(random_state=seed, n_jobs=1),
+            'Bagging' : BaggingClassifier(estimator=DecisionTreeClassifier(), random_state=seed, n_jobs=1),
+            'XGBoost': XGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=1),
+            'MLP' : MLPClassifier(max_iter=500, random_state=seed),
+            'TabNet' : TabNetClassifier(verbose=0, seed=seed),
+            'SVM' : SVC(probability=True, random_state=seed),
+            'LightGBM': LGBMClassifier(random_state=seed, verbosity=-1, n_jobs=1)
+
+
+        }
+        # Filter to only the models requested via CLI
+        active_models = {k: v for k, v in current_models.items() if k in models}
+        dataset = ds_name.split(".")[0]
+        results[ds_name] = {}
+
+        print(f"\n=== Training dataset: {ds_name} ===")
+
+        # ---------- Original dataset ----------
+        print("Training on original dataset...")
+
+        results[ds_name]["Original"] = {
+            "X_train": data["X_train"],
+            "y_train": data["y_train"],
+            "X_test": data["X_test"],
+            "y_test": data["y_test"]
+        }
+
+        X_train_orig = data["X_train"].copy()
+        y_train_orig = data["y_train"].copy()
+        X_test_orig = data["X_test"].copy()
+        y_test_orig = data["y_test"].copy()
+        values, n_classes = np.unique(y_train_orig, return_counts=True)
+        print("Optimizing models parameters...")
+
+        # --- CRONOMETRO: Tuning (Original, sin sampler que ajustar) ---
+        t0 = time.perf_counter()
+        best_model_params = optimize_models_parameters(X_train_orig, y_train_orig, active_models, param_grids, seed=seed)
+        tuning_time_original = time.perf_counter() - t0
+
+        print("Evaluating models...")
+
+        # --- CRONOMETRO: Clasificacion (Original) ---
+        t0 = time.perf_counter()
+        metrics = evaluate_models(X_train_orig, y_train_orig, X_test_orig, y_test_orig, active_models, best_model_params, seed=seed)
+        classification_time_original = time.perf_counter() - t0
+
+        results[ds_name]["Original"]["models"] = {
+            m: {"best_params": best_model_params[m], "metrics": metrics[m]}
+            for m in best_model_params
+        }
+        for model in metrics.keys():
+            metrics[model]["dataset"] = dataset
+            metrics[model]["ratio"] = ""
+            metrics[model]["sampler"] = "Original"
+            metrics[model]["seed"] = seed
+            metrics[model]["n_classes"] = len(n_classes)
+            metrics[model]["nrows"] = X_train_orig.shape[0] + X_test_orig.shape[0]
+            metrics[model]["nfeat"] = X_train_orig.shape[1]
+            # Original no tiene remuestreo -> resampling_time = 0.0
+            metrics[model]["tuning_time"] = tuning_time_original
+            metrics[model]["resampling_time"] = 0.0
+            metrics[model]["classification_time"] = classification_time_original
+            row = pd.Series(metrics[model])
+            table = pd.concat([table, row.to_frame().T], ignore_index=True)
+            #table.to_csv("TablaResultados.csv")
+
+        # ------------ Resampled datasets ----------
+        for sampler_type in samplers:
+            print(f"Applying {sampler_type} ...")
+
+            # Tune sampler parameters
+            print("Optimizing sampler parameters...")
+            tune_type = sampler_type.lower()
+
+            # --- CRONOMETRO: parte 1 de Tuning = ajuste de hiperparametros del sampler ---
+            t0 = time.perf_counter()
+            sampler_params = tune_sampler_for_dataset(
+                X_train_orig.to_numpy().copy(),
+                y_train_orig.to_numpy().copy(),
+                smote_type=tune_type,
+                seed=seed
+            )
+            sampler_tuning_time = time.perf_counter() - t0
+
+            if sampler_params is None:
+                continue
+
+            if sampler_type == "smote":
+                sampler = SMOTE(
+                    k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                    random_state=seed
+                )
+            elif sampler_type == "corsmote":
+                sampler = CorSMOTE(
+                    k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                    top_k_features=sampler_params['best_params']['sampler__top_k_features'],
+                    random_state=seed
+                )
+            elif sampler_type == "adasyn":
+                sampler = ADASYN(
+                    n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                    random_state=seed
+                )
+            elif sampler_type == "borderline":
+                sampler = BorderlineSMOTE(
+                    k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                    kind=sampler_params['best_params']['sampler__kind'],
+                    random_state=seed
+                )
+            elif sampler_type == "safe_level_smote":
+                sampler = SVSamplerWrapper(
+                    sv.Safe_Level_SMOTE,
+                    n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                    random_state=seed
+                )
+            elif sampler_type == "smote_ipf":
+                sampler = SVSamplerWrapper(
+                    sv.SMOTE_IPF,
+                    n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                    n_folds=sampler_params['best_params']['sampler__n_folds'],
+                    random_state=seed
+                )
+            elif sampler_type == "mdo":
+                sampler = SVSamplerWrapper(
+                  sv.MDO,
+                  K2=sampler_params['best_params']['sampler__K2'],
+                  K1_frac=sampler_params['best_params']['sampler__K1_frac'],
+                  random_state=seed
+                )
+            else:
+                raise ValueError(f"Unknown sampler type: {sampler_type}")
+
+            X_train_orig = X_train_orig.astype(float).copy()
+            y_train_orig = y_train_orig.astype(int).copy()
+
+            # --- CRONOMETRO: Remuestreo "base" (el que se usa solo para ajustar los modelos) ---
+            t0 = time.perf_counter()
+            X_res, y_res = sampler.fit_resample(X_train_orig, y_train_orig)
+            base_resampling_time = time.perf_counter() - t0
+
+            results[ds_name][sampler_type] = {
+                "best_sampler_params" : sampler_params['best_params'],
+                "X_resampled" : X_res,
+                "y_resampled" : y_res
+            }
+
+            # Train models on resampled dataset
+            print("Optimizing models parameters...")
+
+            # --- CRONOMETRO: parte 2 de Tuning = ajuste de hiperparametros del modelo ---
+            t0 = time.perf_counter()
+            best_model_params = optimize_models_parameters(X_res, y_res, active_models, param_grids, seed=seed)
+            model_tuning_time = time.perf_counter() - t0
+
+            # Tuning total de esta fila = tunear el sampler (una vez) + tunear los modelos (una vez)
+            # Se repite igual en las 3 filas de ratio de este sampler/dataset/seed, porque ambos pasos
+            # se ejecutan una sola vez antes del bucle de ratios, no por cada ratio.
+            tuning_time_resampled = sampler_tuning_time + model_tuning_time
+
+            results[ds_name][sampler_type]["best_model_params"] = best_model_params
+
+            print("Evaluating models...")
+
+            results[ds_name][sampler_type]["ratios"] = {}
+            for ratio in SAMPLING_RATIOS:
+
+                # Determinar sampling_strategy según si es binario o multiclase
+                class_counts = y_train_orig.value_counts()
+                majority_class = class_counts.idxmax()
+                minority_classes = [c for c in class_counts.index if c != majority_class]
+
+                sampling_strategy = {
+                    c: max(class_counts[c], int(class_counts[majority_class] * ratio))
+                    for c in minority_classes
+                    }
+
+
+                if sampler_type == "smote":
+                    sampler_ratio = SMOTE(
+                        k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                        random_state=seed,
+                        sampling_strategy=sampling_strategy,
+
+                    )
+                elif sampler_type == "corsmote":
+                    sampler_ratio = CorSMOTE(
+                        k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                        top_k_features=sampler_params['best_params']['sampler__top_k_features'],
+                        sampling_strategy=sampling_strategy,
+                        random_state=seed
+                    )
+                elif sampler_type == "adasyn":
+                    sampler_ratio = ADASYN(
+                        n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                        sampling_strategy=sampling_strategy,
+                        random_state=seed
+                    )
+                elif sampler_type == "borderline":
+                    sampler_ratio = BorderlineSMOTE(
+                        k_neighbors=sampler_params['best_params']['sampler__k_neighbors'],
+                        kind=sampler_params['best_params']['sampler__kind'],
+                        sampling_strategy=sampling_strategy,
+                        random_state=seed
+                    )
+                elif sampler_type == "safe_level_smote":
+                    sampler_ratio = SVSamplerWrapper(
+                        sv.Safe_Level_SMOTE,
+                        n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                        proportion=ratio,
+                        random_state=seed
+                    )
+                elif sampler_type == "smote_ipf":
+                    sampler_ratio = SVSamplerWrapper(
+                        sv.SMOTE_IPF,
+                        n_neighbors=sampler_params['best_params']['sampler__n_neighbors'],
+                        n_folds=sampler_params['best_params']['sampler__n_folds'],
+                        proportion=ratio,
+                        random_state=seed
+                    )
+                elif sampler_type == "mdo":
+                    sampler_ratio = SVSamplerWrapper(
+                      sv.MDO,
+                      K2=sampler_params['best_params']['sampler__K2'],
+                      K1_frac=sampler_params['best_params']['sampler__K1_frac'],
+                      proportion=ratio,
+                      random_state=seed
+                    )
+
+                # --- CRONOMETRO: Remuestreo (especifico de este ratio, es el que de verdad se usa para entrenar) ---
+                t0 = time.perf_counter()
+                try:
+                    X_res_r, y_res_r = sampler_ratio.fit_resample(X_train_orig, y_train_orig)
+                except Exception as e:
+                    print(f"[WARN] {sampler_type} with ratio {ratio} failed: {e}")
+                    continue  # pasa al siguiente ratio si falla
+                ratio_resampling_time = time.perf_counter() - t0
+
+                # --- CRONOMETRO: Clasificacion (especifica de este ratio) ---
+                t0 = time.perf_counter()
+                metrics = evaluate_models(X_res_r, y_res_r, X_test_orig, y_test_orig, active_models, best_model_params, seed)
+                classification_time_ratio = time.perf_counter() - t0
+
+                results[ds_name][sampler_type]["ratios"][f"ratio_{ratio}"] = metrics
+
+                for model in metrics.keys():
+                    metrics[model]["dataset"] = dataset
+                    metrics[model]["ratio"] = ratio
+                    metrics[model]["sampler"] = sampler_type
+                    metrics[model]["seed"] = seed
+                    metrics[model]["n_classes"] = len(n_classes)
+                    metrics[model]["nrows"] = X_train_orig.shape[0] + X_test_orig.shape[0]
+                    metrics[model]["nfeat"] = X_train_orig.shape[1]
+                    metrics[model]["tuning_time"] = tuning_time_resampled
+                    metrics[model]["resampling_time"] = ratio_resampling_time
+                    metrics[model]["classification_time"] = classification_time_ratio
+                    row = pd.Series(metrics[model])
+                    table = pd.concat([table, row.to_frame().T], ignore_index=True)
+                    #table.to_csv("TablaResultados.csv")
+
+    # Save results
+    with open(results_file, "wb") as f:
+        pickle.dump(results,f)
+
+    print(f"\nPipeline completed. Results saved to {results_file}")
+
+    return results, table
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run training pipeline")
+
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help= "List of dataset filenames to process. Default: all CSVs in the datasets/ directory."
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="If set, overwrite existing results for datasets"
+    )
+
+
+    parser.add_argument(
+        "--results_file",
+        type=str,
+        default="results.pkl",
+        help="Pickle file to save/load results."
+    )
+
+    parser.add_argument(
+        "--samplers",
+        nargs="+",
+        default=None,
+        choices=["none", "smote", "borderline", "adasyn", "corsmote", "safe_level_smote", "smote_ipf", "mdo"],
+        help=(
+            "Samplers to use. Default: all_samplers"
+            "Options: none, smote, corsmote, adasyn, borderline"
+        )
+    )
+
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        choices=["dt", "rf","bagging", "lightgbm", "xgboost", "mlp", "tabnet", "svm"],
+        help=(
+            "Models to use. Default: all_models"
+            "Options: rf, lightgbm, xgboost"
+        )
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Specific seed"
+    )
+
+    args = parser.parse_args()
+
+    if args.samplers is None:
+        selected_samplers = ["smote", "corsmote", "adasyn", "borderline", "safe_level_smote", "smote_ipf", "mdo"]
+
+    elif "none" in args.samplers:
+        selected_samplers = []
+
+    else:
+        selected_samplers = args.samplers
+
+
+    if args.models is None:
+        selected_models = ["dt", "rf","bagging", "lightgbm", "xgboost", "mlp", "tabnet",  "svm"]
+
+    else:
+        selected_models = args.models
+
+    selected_models = [MODELS_MAP[m] for m in selected_models]
+    if args.seed is not None:
+        iters = [args.seed]
+    else:
+        iters = list(range(30))
+    # Solo para sacar los nombres de dataset (la carga real por seed sigue igual)
+    sample_prepared = prepare_datasets(dataset_names=args.datasets, seed=iters[0])
+    sorted_names = sorted(sample_prepared.keys())
+    for ds_name in sorted_names:
+        ds_clean = ds_name.replace(".csv", "")
+        if args.seed is not None:
+            output_csv = f"Resultados_Seed_{args.seed}_{ds_clean}.csv"
+        else:
+            output_csv = f"TablaResultados_Completa_{ds_clean}.csv"
+        # --- Resume: seeds ya completadas en el csv existente ---
+        if os.path.exists(output_csv):
+            results_df = pd.read_csv(output_csv)
+            done_seeds = set(results_df["seed"].unique())
+            # Si el CSV es de una version anterior sin columnas de tiempo, las anadimos vacias
+            # para no romper el pd.concat de mas abajo.
+            for col in TIME_COLS:
+                if col not in results_df.columns:
+                    results_df[col] = np.nan
+            print(f"[RESUME] {ds_clean}: seeds ya completadas -> {sorted(done_seeds)}")
+        else:
+            results_df = pd.DataFrame(columns=[
+                'Model', 'Accuracy', 'Precision', 'Recall', 'F1', 'F1_minority',
+                'Kappa', 'MCC', 'dataset', 'ratio', 'sampler', 'seed',
+                'n_classes', "nrows", "nfeat", *TIME_COLS
+            ])
+            done_seeds = set()
+        pending_seeds = [s for s in iters if s not in done_seeds]
+        if not pending_seeds:
+            print(f"[SKIP] {ds_clean}: todas las seeds ya estaban completas.")
+            continue
+        for current_seed in tqdm(pending_seeds, desc=ds_clean):
+            prepared_datasets = prepare_datasets(dataset_names=[ds_name], seed=current_seed)
+            single_ds = {ds_name: prepared_datasets[ds_name]}
+            res, results_df = run_training_pipeline(
+                prepared_datasets=single_ds,
+                models=selected_models,
+                param_grids=param_grids,
+                results_file=f"results_seed_{current_seed}_{ds_clean}.pkl",
+                overwrite=args.overwrite,
+                samplers=selected_samplers,
+                seed=current_seed,
+                table=results_df
+            )
+            results_df.to_csv(output_csv, index=False)

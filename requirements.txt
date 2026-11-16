@@ -1,0 +1,13 @@
+# Python 3.11
+numpy
+pandas
+scikit-learn>=1.7      # KBinsDiscretizer(quantile_method=...) requires >= 1.7
+imbalanced-learn
+smote-variants
+xgboost
+lightgbm
+pytorch-tabnet
+torch
+tqdm
+matplotlib
+plotly
